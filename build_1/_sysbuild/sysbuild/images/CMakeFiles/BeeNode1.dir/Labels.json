@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/CMakeFiles/BeeNode1"
+		},
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/CMakeFiles/BeeNode1.rule"
+		},
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/CMakeFiles/BeeNode1-complete.rule"
+		},
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/BeeNode1-prefix/src/BeeNode1-stamp/BeeNode1-build.rule"
+		},
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/BeeNode1-prefix/src/BeeNode1-stamp/BeeNode1-configure.rule"
+		},
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/BeeNode1-prefix/src/BeeNode1-stamp/BeeNode1-download.rule"
+		},
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/BeeNode1-prefix/src/BeeNode1-stamp/BeeNode1-install.rule"
+		},
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/BeeNode1-prefix/src/BeeNode1-stamp/BeeNode1-mkdir.rule"
+		},
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/BeeNode1-prefix/src/BeeNode1-stamp/BeeNode1-patch.rule"
+		},
+		{
+			"file" : "C:/ncs/BeeNode1/build_1/_sysbuild/sysbuild/images/BeeNode1-prefix/src/BeeNode1-stamp/BeeNode1-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"BeeNode1"
+		],
+		"name" : "BeeNode1"
+	}
+}

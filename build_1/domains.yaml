@@ -1,0 +1,7 @@
+default: BeeNode1
+build_dir: C:/ncs/BeeNode1/build_1
+domains:
+  - name: BeeNode1
+    build_dir: C:/ncs/BeeNode1/build_1/BeeNode1
+flash_order:
+  - BeeNode1
