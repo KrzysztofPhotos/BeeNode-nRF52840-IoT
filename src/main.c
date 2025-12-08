@@ -9,7 +9,7 @@
 
 /* ---------------- Sensor frame ---------------- */
 struct __packed sensor_frame_t {
-    uint8_t  dev_id_3[3];    
+    uint8_t  dev_id_3[3];   //hej 
     uint32_t date_hour;      
     int16_t  temp_x10;
     int16_t  hum_x10;
@@ -154,7 +154,7 @@ static void system_on_sleep_seconds(uint32_t seconds)
 {
 
 
-    printk("Entering ULTRA LOW POWER for %u s...\n", seconds);
+    printk("Entering tak ULTRA LOW POWER for %u s...\n", seconds);
 
     /* Start low frequency clock required by RTC1 */
     NRF_CLOCK->TASKS_LFCLKSTART = 1;
