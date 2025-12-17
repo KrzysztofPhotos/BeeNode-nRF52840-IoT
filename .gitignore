@@ -1,4 +1,14 @@
-*.code-workspace
-.vscode/
-.DS_Store
-**/.DS_Store
+# Ignoruj wszystko
+*
+
+# Pozwól na katalogi (konieczne!)
+!*/
+
+# Pozwól na folder src
+!src/
+
+# Śledzone pliki
+!src/main.c
+!prj.conf
+!README.md
+!README.txt
