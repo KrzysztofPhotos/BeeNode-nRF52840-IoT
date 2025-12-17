@@ -5,6 +5,8 @@
 #include <zephyr/bluetooth/hci.h>
 #include <nrfx.h>
 #include <string.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
 
 /* ---------------- Sensor frame ---------------- */
 struct __packed sensor_frame_t {
@@ -20,6 +22,21 @@ struct __packed sensor_frame_t {
     char     pp[2];
 };
 static struct sensor_frame_t frame;
+
+/* Definiujemy ID naszego serwisu (wymóg GATT) */
+static struct bt_uuid_128 my_uuid = BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0));
+
+/* Funkcja pozwalająca telefonowi czytać dane */
+static ssize_t read_f(struct bt_conn *c, const struct bt_gatt_attr *a, void *b, uint16_t l, uint16_t o) {
+    return bt_gatt_attr_read(c, a, b, l, o, &frame, sizeof(frame));
+}
+
+/* Rejestrujemy Serwis GATT - teraz to jest oficjalny sensor */
+BT_GATT_SERVICE_DEFINE(my_svc,
+    BT_GATT_PRIMARY_SERVICE(&my_uuid),
+    BT_GATT_CHARACTERISTIC(&my_uuid.uuid, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_READ, read_f, NULL, &frame),
+    BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
+);
 
 /* Manufacturer data */
 static uint8_t mfg_data[2 + sizeof(frame)] = {0x59, 0x00};
