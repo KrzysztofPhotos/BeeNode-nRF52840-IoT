@@ -1,5 +1,0 @@
-west:
-  command: C:\ncs\toolchains\c1a76fddb2\opt\bin\Scripts\west build --build-dir c:/ncs/BeeNode1/build
-    --domain BeeNode1
-  topdir: c:\ncs\v3.1.1
-  version: 1.4.0
