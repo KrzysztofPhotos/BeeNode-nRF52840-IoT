@@ -39,8 +39,8 @@
 /* ============================================================================
  * KONFIGURACJA CZASOWA
  * ============================================================================ */
-#define ADVERTISING_DURATION_MS  10000   // 30 sekund advertising (30000)
-#define DEEP_SLEEP_DURATION_S    60     // 10 minut deep sleep (600)
+#define ADVERTISING_DURATION_MS  30000   // 30 sekund advertising (30000)
+#define DEEP_SLEEP_DURATION_S    600     // 10 minut deep sleep (600)
 #define ADV_UPDATE_INTERVAL_MS   1000    // Aktualizacja danych co 1s podczas advertising
 
 /* ============================================================================
@@ -386,27 +386,45 @@ static void stop_advertising(void)
  */
 static void enter_deep_sleep(uint32_t seconds)
 {
-    ARG_UNUSED(seconds);
+    printk("System OFF na %u sekund\n", seconds);
 
-    printk("Dobranoc...\n");
+    /* 1. Start LFCLK (RTC tego wymaga) */
+    NRF_CLOCK->TASKS_LFCLKSTART = 1;
+    while (!NRF_CLOCK->EVENTS_LFCLKSTARTED);
+    NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
 
-    // BUTTON 1 = P0.11 (active low)
-    NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0, 11)] =
+    /* 2. Konfiguracja RTC1 */
+    NRF_RTC1->TASKS_STOP = 1;
+    NRF_RTC1->TASKS_CLEAR = 1;
+    NRF_RTC1->PRESCALER = 0; // 32768 Hz
+
+    uint32_t ticks = seconds * 32768;
+    if (ticks > 0x00FFFFFF) {
+        ticks = 0x00FFFFFF;
+    }
+
+    NRF_RTC1->CC[0] = ticks;
+    NRF_RTC1->EVENTS_COMPARE[0] = 0;
+    NRF_RTC1->EVTENSET = RTC_EVTENSET_COMPARE0_Msk;
+    NRF_RTC1->TASKS_START = 1;
+
+    /* 3. Wake-up z przycisku (P0.11 – BUTTON1) */
+    NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0,11)] =
         (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos) |
         (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
         (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
         (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos);
 
-    printk("SYSTEM OFF (HW)\n");
+    printk("SYSTEM OFF\n");
 
-    // Bez żadnego sleep!
-    NRF_POWER->RESETREAS = 0xFFFFFFFF;
+    /* 4. System OFF */
     NRF_POWER->SYSTEMOFF = 1;
 
     while (1) {
         __WFE();
     }
 }
+
 
 /* ============================================================================
  * MAIN LOOP
