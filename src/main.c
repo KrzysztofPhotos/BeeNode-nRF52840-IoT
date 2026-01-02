@@ -30,12 +30,17 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <nrfx.h>
 #include <string.h>
+#include <zephyr/sys/poweroff.h> // dla uzywania sys_poweroff()
+#include <hal/nrf_gpio.h>
+#include <hal/nrf_radio.h>
+#include <hal/nrf_power.h>
+
 
 /* ============================================================================
  * KONFIGURACJA CZASOWA
  * ============================================================================ */
-#define ADVERTISING_DURATION_MS  30000   // 30 sekund advertising
-#define DEEP_SLEEP_DURATION_S    600     // 10 minut deep sleep (600s)
+#define ADVERTISING_DURATION_MS  10000   // 30 sekund advertising (30000)
+#define DEEP_SLEEP_DURATION_S    60     // 10 minut deep sleep (600)
 #define ADV_UPDATE_INTERVAL_MS   1000    // Aktualizacja danych co 1s podczas advertising
 
 /* ============================================================================
@@ -134,16 +139,16 @@ BT_GATT_SERVICE_DEFINE(beenode_svc,
  * ============================================================================ */
 
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(DT_ALIAS(sw0), gpios, {0});
-static struct gpio_callback button_cb;
-static volatile bool button_pressed = false;
+// static struct gpio_callback button_cb;
+// static volatile bool button_pressed = false;
 
-static void button_pressed_isr(const struct device *dev, 
-                               struct gpio_callback *cb, 
-                               uint32_t pins)
-{
-    button_pressed = true;
-    printk("Przycisk wciśnięty!\n");
-}
+// static void button_pressed_isr(const struct device *dev, 
+//                                struct gpio_callback *cb, 
+//                                uint32_t pins)
+// {
+//     button_pressed = true;
+//     printk("Przycisk wciśnięty!\n");
+// }
 
 static int button_setup(void)
 {
@@ -153,9 +158,9 @@ static int button_setup(void)
     }
 
     gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
-    gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
-    gpio_init_callback(&button_cb, button_pressed_isr, BIT(button.pin));
-    gpio_add_callback(button.port, &button_cb);
+    // gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+    // gpio_init_callback(&button_cb, button_pressed_isr, BIT(button.pin));
+    // gpio_add_callback(button.port, &button_cb);
     
     printk("Przycisk skonfigurowany (pin %d)\n", button.pin);
     return 0;
@@ -381,51 +386,23 @@ static void stop_advertising(void)
  */
 static void enter_deep_sleep(uint32_t seconds)
 {
-    printk("\n=== WCHODZIMY W DEEP SLEEP NA %u SEKUND ===\n\n", seconds);
-    
-    // 1. Zatrzymaj advertising
-    stop_advertising();
-    k_sleep(K_MSEC(100));  // Daj czas na zatrzymanie
-    
-    // 2. Odłącz się od połączenia (jeśli istnieje)
-    if (current_conn) {
-        bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        k_sleep(K_MSEC(100));
-    }
-    
-    // 3. Konfiguracja RTC1 do wybudzenia
-    NRF_CLOCK->TASKS_LFCLKSTART = 1;
-    while (!NRF_CLOCK->EVENTS_LFCLKSTARTED);
-    NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
-    
-    NRF_RTC1->TASKS_STOP = 1;
-    NRF_RTC1->TASKS_CLEAR = 1;
-    NRF_RTC1->PRESCALER = 0;  // 32768 Hz
-    
-    // Oblicz ticki (1 tick = 1/32768 s)
-    uint32_t ticks = 32768UL * seconds;
-    if (ticks > 0x00FFFFFF) {  // RTC ma tylko 24 bity
-        ticks = 0x00FFFFFF;
-        printk("WARN: Czas sleep przekracza limit, ustawiono max\n");
-    }
-    
-    NRF_RTC1->CC[0] = ticks;
-    NRF_RTC1->EVENTS_COMPARE[0] = 0;
-    NRF_RTC1->INTENSET = RTC_INTENSET_COMPARE0_Msk;
-    
-    NVIC_ClearPendingIRQ(RTC1_IRQn);
-    NVIC_EnableIRQ(RTC1_IRQn);
-    
-    NRF_RTC1->TASKS_START = 1;
-    
-    // 4. Przejdź w System OFF
-    // Po wybudzeniu system zrestartuje się od początku main()
+    ARG_UNUSED(seconds);
+
     printk("Dobranoc...\n");
-    k_sleep(K_MSEC(100));  // Flush UART
-    
-    // TODO: Użyj sys_poweroff() gdy dostępne w Twoim SDK
-    // Na razie symulujemy przez WFE
-    __disable_irq();
+
+    // BUTTON 1 = P0.11 (active low)
+    NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0, 11)] =
+        (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos) |
+        (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
+        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+        (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos);
+
+    printk("SYSTEM OFF (HW)\n");
+
+    // Bez żadnego sleep!
+    NRF_POWER->RESETREAS = 0xFFFFFFFF;
+    NRF_POWER->SYSTEMOFF = 1;
+
     while (1) {
         __WFE();
     }
@@ -455,6 +432,11 @@ int main(void)
         return err;
     }
     k_sleep(K_MSEC(500));  // Daj czas na inicjalizację
+
+    // --- TX POWER +4 dBm ---
+    // Ustaw TX power radia na +4 dBm (nRF52840)
+    NRF_RADIO->TXPOWER = RADIO_TXPOWER_TXPOWER_Pos4dBm;
+    printk("TX power ustawiony na +4 dBm (RADIO)\n");
 
     printk("\n=== GŁÓWNA PĘTLA PROGRAMU ===\n\n");
 
@@ -504,13 +486,6 @@ int main(void)
             if ((k_uptime_get() - adv_start_time) % ADV_UPDATE_INTERVAL_MS == 0) {
                 update_sensor_frame();
                 bt_le_adv_update_data(ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-            }
-            
-            // Opcjonalnie: przycisk przedłuża advertising
-            if (button_pressed) {
-                printk("Przycisk - restart czasu advertising\n");
-                button_pressed = false;
-                adv_start_time = k_uptime_get();
             }
             
             k_sleep(K_MSEC(100));
