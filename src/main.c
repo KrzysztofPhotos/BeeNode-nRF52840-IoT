@@ -106,9 +106,30 @@ static int32_t hx711_read(void) {
     return count;
 }
 
+
+// === PARAMETRY KALIBRACJI WAGI ===
+// wartość, która wyświetla się, gdy waga jest całkowicie PUSTA
+#define TARE_OFFSET -600000
+
+// Zmieniaj ten współczynnik, aż położenie 1kg pokaże równe 1.000 kg
+#define CALIB_FACTOR 400000.0 
+
 static void test_read_weight(void) {
     int32_t raw_val = hx711_read();
-    printk(">>> ODCZYT WAGI (SUROWY): %d <<<\n", raw_val);
+
+    // 1. Obliczamy różnicę względem zera (i odwracamy znak, bo u Ciebie waga maleje pod naciskiem)
+    int32_t weight_no_tare = TARE_OFFSET - raw_val;
+
+    // Jeśli waga lekko "pływa" na minusie w spoczynku, zaokrąglamy do zera
+    if (weight_no_tare < 0 && weight_no_tare > -5000) {
+        weight_no_tare = 0;
+    }
+
+    // 2. Zamieniamy na kilogramy
+    double weight_kg = (double)weight_no_tare / CALIB_FACTOR;
+
+    // Drukujemy i surową wartość (do ewentualnej poprawki tary) i gotowe kilogramy
+    printk(">>> SUROWY: %d | WAGA: %.3f kg <<<\n", raw_val, weight_kg);
 }
 
 
