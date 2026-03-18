@@ -1,4 +1,3 @@
-#include <zephyr/drivers/gpio.h>
 /**
  * ============================================================================
  * BeeNode - Beehive Monitoring System
@@ -35,7 +34,7 @@
 #include <hal/nrf_gpio.h>
 #include <hal/nrf_radio.h>
 #include <hal/nrf_power.h>
-
+#include <zephyr/settings/settings.h>
 
 /* ============================================================================
  * KONFIGURACJA CZASOWA
@@ -107,28 +106,119 @@ static int32_t hx711_read(void) {
 }
 
 
-// === PARAMETRY KALIBRACJI WAGI ===
-// wartość, która wyświetla się, gdy waga jest całkowicie PUSTA
-#define TARE_OFFSET -600000
+/* ============================================================================
+ * PARAMETRY KALIBRACJI I PAMIĘĆ NVS
+ * ============================================================================ */
+int32_t tare_offset = -600000;         // Domyslna tara
+float calib_factor = 1000000.0;        // Domyslny wspolczynnik
+float known_weight_kg = 0.1835;         // WAGA REDMI NOTE 12 4g
+volatile bool start_calibration = false;
 
-// Zmieniaj ten współczynnik, aż położenie 1kg pokaże równe 1.000 kg
-#define CALIB_FACTOR 400000.0 
+// Funkcja obsługująca zapis/odczyt z pamięci flash (NVS)
+static int scale_settings_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg) {
+    const char *next;
+    if (settings_name_steq(name, "tare", &next) && !next) {
+        if (len != sizeof(tare_offset)) return -EINVAL;
+        read_cb(cb_arg, &tare_offset, sizeof(tare_offset));
+        return 0;
+    }
+    if (settings_name_steq(name, "factor", &next) && !next) {
+        if (len != sizeof(calib_factor)) return -EINVAL;
+        read_cb(cb_arg, &calib_factor, sizeof(calib_factor));
+        return 0;
+    }
+    return -ENOENT;
+}
 
+struct settings_handler scale_conf = {
+    .name = "scale",
+    .h_set = scale_settings_set,
+};
+
+/* ============================================================================
+ * PRZYCISK (SW1) - OBSŁUGA PRZERWAŃ
+ * ============================================================================ */
+static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(DT_ALIAS(sw0), gpios, {0});
+static struct gpio_callback button_cb;
+
+static void button_pressed_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    start_calibration = true; // Flaga uruchamiajaca proces z opoznieniami
+}
+
+static int button_setup(void) {
+    if (!device_is_ready(button.port)) {
+        printk("WARN: Przycisk niedostępny\n");
+        return -ENODEV;
+    }
+    gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
+    gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+    gpio_init_callback(&button_cb, button_pressed_isr, BIT(button.pin));
+    gpio_add_callback(button.port, &button_cb);
+    printk("Przycisk SW1 gotowy do startu kalibracji!\n");
+    return 0;
+}
+
+/* ============================================================================
+ * POMOCNICZA: UŚREDNIANIE (jak w Arduino)
+ * ============================================================================ */
+static int32_t hx711_read_average(int times) {
+    int64_t sum = 0;
+    for (int i = 0; i < times; i++) {
+        sum += hx711_read();
+        k_sleep(K_MSEC(10)); // Krotka przerwa miedzy odczytami
+    }
+    return (int32_t)(sum / times);
+}
+
+/* ============================================================================
+ * ODCZYT I KALIBRACJA WAGI
+ * ============================================================================ */
 static void test_read_weight(void) {
-    int32_t raw_val = hx711_read();
-
-    // 1. Obliczamy różnicę względem zera (i odwracamy znak, bo u Ciebie waga maleje pod naciskiem)
-    int32_t weight_no_tare = TARE_OFFSET - raw_val;
-
-    // Jeśli waga lekko "pływa" na minusie w spoczynku, zaokrąglamy do zera
-    if (weight_no_tare < 0 && weight_no_tare > -5000) {
-        weight_no_tare = 0;
+    // 1. PROCEDURA KALIBRACJI (Zainspirowana Arduino - z opoznieniami)
+    if (start_calibration) {
+        start_calibration = false;
+        
+        printk("\n========================================\n");
+        printk("          START KALIBRACJI\n");
+        printk("========================================\n");
+        
+        // Odpowiednik Arduino: Serial.println("Tare... remove any weights..."); delay(5000);
+        printk("1. Zdejmij wszystko z wagi!\n");
+        printk("   Masz 5 sekund...\n");
+        k_sleep(K_SECONDS(5));
+        
+        // Odpowiednik Arduino: scale.tare();
+        tare_offset = hx711_read_average(10); // Pobieramy srednia z 10 pomiarow
+        settings_save_one("scale/tare", &tare_offset, sizeof(tare_offset));
+        printk(">>> Tara zrobiona! (Wartosc: %d) <<<\n\n", tare_offset);
+        
+        // Odpowiednik Arduino: Serial.print("Place a known weight..."); delay(5000);
+        printk("2. Poloz swoj telefon (%.3f kg) na wadze!\n", known_weight_kg);
+        printk("   Masz 5 sekund...\n");
+        k_sleep(K_SECONDS(5));
+        
+        // Odpowiednik Arduino: scale.get_units(10) i matematyka
+        int32_t reading = hx711_read_average(10);
+        calib_factor = (float)(tare_offset - reading) / known_weight_kg;
+        settings_save_one("scale/factor", &calib_factor, sizeof(calib_factor));
+        
+        printk(">>> Wspolczynnik wyliczony! (Wartosc: %.1f) <<<\n", calib_factor);
+        printk("========================================\n");
+        printk("        KALIBRACJA ZAKONCZONA!\n");
+        printk("========================================\n\n");
+        return; 
     }
 
-    // 2. Zamieniamy na kilogramy
-    double weight_kg = (double)weight_no_tare / CALIB_FACTOR;
-
-    // Drukujemy i surową wartość (do ewentualnej poprawki tary) i gotowe kilogramy
+    // 2. NORMALNY ODCZYT (odpala sie caly czas, gdy nie kalibrujemy)
+    int32_t raw_val = hx711_read();
+    int32_t weight_no_tare = tare_offset - raw_val;
+    
+    // Delikatne zerowanie szumow w okolicach zera (do 5 gramow)
+    if (weight_no_tare < 0 && weight_no_tare > -5000) {
+        weight_no_tare = 0; 
+    }
+    
+    double weight_kg = (double)weight_no_tare / calib_factor;
     printk(">>> SUROWY: %d | WAGA: %.3f kg <<<\n", raw_val, weight_kg);
 }
 
@@ -230,7 +320,7 @@ BT_GATT_SERVICE_DEFINE(beenode_svc,
  * PRZYCISK (opcjonalny - do testowania)
  * ============================================================================ */
 
-static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(DT_ALIAS(sw0), gpios, {0});
+//static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(DT_ALIAS(sw0), gpios, {0});
 // static struct gpio_callback button_cb;
 // static volatile bool button_pressed = false;
 
@@ -242,21 +332,21 @@ static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(DT_ALIAS(sw0), gpi
 //     printk("Przycisk wciśnięty!\n");
 // }
 
-static int button_setup(void)
-{
-    if (!device_is_ready(button.port)) {
-        printk("WARN: Przycisk niedostępny\n");
-        return -ENODEV;
-    }
+// static int button_setup(void)
+// {
+//     if (!device_is_ready(button.port)) {
+//         printk("WARN: Przycisk niedostępny\n");
+//         return -ENODEV;
+//     }
 
-    gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
-    // gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
-    // gpio_init_callback(&button_cb, button_pressed_isr, BIT(button.pin));
-    // gpio_add_callback(button.port, &button_cb);
+//     gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
+//     // gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+//     // gpio_init_callback(&button_cb, button_pressed_isr, BIT(button.pin));
+//     // gpio_add_callback(button.port, &button_cb);
     
-    printk("Przycisk skonfigurowany (pin %d)\n", button.pin);
-    return 0;
-}
+//     printk("Przycisk skonfigurowany (pin %d)\n", button.pin);
+//     return 0;
+// }
 
 /* ============================================================================
  * GENERATORY FAKE DANYCH (do testów bez czujników)
@@ -535,8 +625,15 @@ int main(void)
     // Inicjalizacja naszej wagi
     hx711_init();
 
-    // Inicjalizacja przycisku (opcjonalna)
+    // Inicjalizacja przycisku
     button_setup();
+
+    // --- Inicjalizacja i wczytanie pamieci ---
+    settings_subsys_init();
+    settings_register(&scale_conf);
+    settings_load();
+    printk("Zaladowano z pamieci NVS -> Tara: %d, Wspolczynnik: %.1f\n", tare_offset, calib_factor);
+    // -----------------------------------------
 
     // Inicjalizacja Bluetooth
     int err = bt_enable(bt_ready);
