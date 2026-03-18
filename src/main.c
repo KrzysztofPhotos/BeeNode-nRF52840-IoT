@@ -1,3 +1,4 @@
+#include <zephyr/drivers/gpio.h>
 /**
  * ============================================================================
  * BeeNode - Beehive Monitoring System
@@ -18,7 +19,7 @@
  * - Dane w GATT Service (nie tylko w advertising)
  * - UUID do identyfikacji serwisu i charakterystyk
  */
-
+#include <zephyr/drivers/sensor.h>
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
@@ -42,6 +43,76 @@
 #define ADVERTISING_DURATION_MS  30000   // 30 sekund advertising (30000)
 #define DEEP_SLEEP_DURATION_S    600     // 10 minut deep sleep (600)
 #define ADV_UPDATE_INTERVAL_MS   1000    // Aktualizacja danych co 1s podczas advertising
+
+
+// Definicje pinow dla nRF52840-DK (DT=27, SCK=26)
+#define HX711_DT_PIN  27
+#define HX711_SCK_PIN 26
+
+static const struct device *gpio0_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+
+// Inicjalizacja pinów
+static void hx711_init(void) {
+    if (!device_is_ready(gpio0_dev)) {
+        printk("BLAD: Port GPIO0 nie jest gotowy!\n");
+        return;
+    }
+    // Zegar jako wyjscie (stan niski na start), Dane jako wejscie
+    gpio_pin_configure(gpio0_dev, HX711_SCK_PIN, GPIO_OUTPUT_INACTIVE);
+    gpio_pin_configure(gpio0_dev, HX711_DT_PIN, GPIO_INPUT);
+    printk("HX711 zainicjalizowany recznie (pin 26 i 27)\n");
+}
+
+// Funkcja bit-banging czytajaca dane z HX711
+static int32_t hx711_read(void) {
+    int32_t count = 0;
+    int timeout = 10000; 
+
+    // Czekaj az uklad bedzie gotowy (linia DT zejdzie na LOW)
+    while (gpio_pin_get(gpio0_dev, HX711_DT_PIN) == 1 && timeout > 0) {
+        k_busy_wait(10);
+        timeout--;
+    }
+
+    if (timeout == 0) {
+        printk("BLAD: Timeout - HX711 nie odpowiada!\n");
+        return 0;
+    }
+
+    // Odczyt 24 bitow danych
+    for (int i = 0; i < 24; i++) {
+        gpio_pin_set(gpio0_dev, HX711_SCK_PIN, 1);
+        k_busy_wait(1); // 1 mikrosekunda w gore
+        count = count << 1;
+        gpio_pin_set(gpio0_dev, HX711_SCK_PIN, 0);
+        k_busy_wait(1); // 1 mikrosekunda w dol
+        
+        if (gpio_pin_get(gpio0_dev, HX711_DT_PIN)) {
+            count++;
+        }
+    }
+
+    // 25 impuls to ustawienie wzmocnienia na 128 dla kolejnego pomiaru
+    gpio_pin_set(gpio0_dev, HX711_SCK_PIN, 1);
+    k_busy_wait(1);
+    gpio_pin_set(gpio0_dev, HX711_SCK_PIN, 0);
+    k_busy_wait(1);
+
+    // Format U2 (wartosci ujemne)
+    if (count & 0x800000) {
+        count |= 0xFF000000;
+    }
+
+    return count;
+}
+
+static void test_read_weight(void) {
+    int32_t raw_val = hx711_read();
+    printk(">>> ODCZYT WAGI (SUROWY): %d <<<\n", raw_val);
+}
+
+
+
 
 /* ============================================================================
  * STRUKTURA DANYCH SENSORYCZNYCH
@@ -440,6 +511,9 @@ int main(void)
     printk("Build: %s %s\n", __DATE__, __TIME__);
     printk("========================================\n\n");
 
+    // Inicjalizacja naszej wagi
+    hx711_init();
+
     // Inicjalizacja przycisku (opcjonalna)
     button_setup();
 
@@ -507,6 +581,8 @@ int main(void)
             }
             
             k_sleep(K_MSEC(100));
+            
+            test_read_weight(); // <--- NASZA WAGA JEST TUTAJ
         }
 
         // Zatrzymaj advertising po upływie czasu
