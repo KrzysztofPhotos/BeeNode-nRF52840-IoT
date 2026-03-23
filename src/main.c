@@ -136,25 +136,55 @@ struct settings_handler scale_conf = {
 };
 
 /* ============================================================================
- * PRZYCISK (SW1) - OBSŁUGA PRZERWAŃ
+ * INTERFEJS: LED 1 (Status) i PRZYCISK SW2 (Kalibracja)
  * ============================================================================ */
-static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(DT_ALIAS(sw0), gpios, {0});
-static struct gpio_callback button_cb;
+// --- LED i Timer do mrugania w tle ---
+static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
-static void button_pressed_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
-    start_calibration = true; // Flaga uruchamiajaca proces z opoznieniami
+static void led_timer_isr(struct k_timer *timer_id) {
+    gpio_pin_toggle_dt(&led0); // Zmiana stanu diody na przeciwny
+}
+K_TIMER_DEFINE(led_blink_timer, led_timer_isr, NULL);
+
+enum led_mode { LED_OFF, LED_BLINK_SLOW, LED_BLINK_FAST };
+
+static void set_led_mode(enum led_mode mode) {
+    if (!device_is_ready(led0.port)) return;
+    
+    if (mode == LED_OFF) {
+        k_timer_stop(&led_blink_timer);
+        gpio_pin_set_dt(&led0, 0); // Wylacz diode
+    } else if (mode == LED_BLINK_SLOW) {
+        k_timer_start(&led_blink_timer, K_MSEC(500), K_MSEC(500)); // Mruga co pol sekundy
+    } else if (mode == LED_BLINK_FAST) {
+        k_timer_start(&led_blink_timer, K_MSEC(100), K_MSEC(100)); // Mruga bardzo szybko
+    }
 }
 
-static int button_setup(void) {
-    if (!device_is_ready(button.port)) {
-        printk("WARN: Przycisk niedostępny\n");
-        return -ENODEV;
+// --- Przycisk SW2 (Button 2) do Kalibracji ---
+static const struct gpio_dt_spec btn_calib = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static struct gpio_callback btn_calib_cb;
+
+static void btn_calib_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    start_calibration = true;
+}
+
+static int ui_setup(void) {
+    // 1. Inicjalizacja LED
+    if (device_is_ready(led0.port)) {
+        gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
     }
-    gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
-    gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
-    gpio_init_callback(&button_cb, button_pressed_isr, BIT(button.pin));
-    gpio_add_callback(button.port, &button_cb);
-    printk("Przycisk SW1 gotowy do startu kalibracji!\n");
+
+    // 2. Inicjalizacja Przycisku SW2
+    if (device_is_ready(btn_calib.port)) {
+        gpio_pin_configure_dt(&btn_calib, GPIO_INPUT | GPIO_PULL_UP);
+        gpio_pin_interrupt_configure_dt(&btn_calib, GPIO_INT_EDGE_TO_ACTIVE);
+        gpio_init_callback(&btn_calib_cb, btn_calib_isr, BIT(btn_calib.pin));
+        gpio_add_callback(btn_calib.port, &btn_calib_cb);
+        printk("Gotowe! SW2 odpala kalibracje, LED0 pokazuje status.\n");
+    } else {
+        printk("WARN: Przycisk SW2 niedostepny!\n");
+    }
     return 0;
 }
 
@@ -182,7 +212,8 @@ static void test_read_weight(void) {
         printk("          START KALIBRACJI\n");
         printk("========================================\n");
         
-        // Odpowiednik Arduino: Serial.println("Tare... remove any weights..."); delay(5000);
+        // FAZA 1: TARA (WOLNE MRUGANIE)
+        set_led_mode(LED_BLINK_SLOW);
         printk("1. Zdejmij wszystko z wagi!\n");
         printk("   Masz 5 sekund...\n");
         k_sleep(K_SECONDS(5));
@@ -192,7 +223,8 @@ static void test_read_weight(void) {
         settings_save_one("scale/tare", &tare_offset, sizeof(tare_offset));
         printk(">>> Tara zrobiona! (Wartosc: %d) <<<\n\n", tare_offset);
         
-        // Odpowiednik Arduino: Serial.print("Place a known weight..."); delay(5000);
+        // FAZA 2: WSPÓŁCZYNNIK (SZYBKIE MRUGANIE)
+        set_led_mode(LED_BLINK_FAST);
         printk("2. Poloz swoj telefon (%.3f kg) na wadze!\n", known_weight_kg);
         printk("   Masz 5 sekund...\n");
         k_sleep(K_SECONDS(5));
@@ -206,6 +238,9 @@ static void test_read_weight(void) {
         printk("========================================\n");
         printk("        KALIBRACJA ZAKONCZONA!\n");
         printk("========================================\n\n");
+        
+        // KONIEC: WYLACZ DIODE
+        set_led_mode(LED_OFF);
         return; 
     }
 
@@ -625,8 +660,8 @@ int main(void)
     // Inicjalizacja naszej wagi
     hx711_init();
 
-    // Inicjalizacja przycisku
-    button_setup();
+    // Inicjalizacja interfejsu (LED + SW2)
+    ui_setup();
 
     // --- Inicjalizacja i wczytanie pamieci ---
     settings_subsys_init();
