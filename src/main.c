@@ -201,6 +201,15 @@ static int32_t hx711_read_average(int times) {
 }
 
 /* ============================================================================
+ * DANE BLUETOOTH (Zmienne globalne dla GATT)
+ * ============================================================================ */
+uint16_t current_weight_ble = 0;       // Waga dla BLE (rozdzielczosc 0.005 kg)
+uint8_t  current_battery_level = 88;   // Procent baterii (0-100%)
+uint16_t current_battery_voltage = 395;// Napiecie baterii (395 = 3.95V)
+int16_t  current_temperature = 2250;   // Temperatura (2250 = 22.50 °C)
+
+
+/* ============================================================================
  * ODCZYT I KALIBRACJA WAGI
  * ============================================================================ */
 static void test_read_weight(void) {
@@ -254,225 +263,128 @@ static void test_read_weight(void) {
     }
     
     double weight_kg = (double)weight_no_tare / calib_factor;
-    printk(">>> SUROWY: %d | WAGA: %.3f kg <<<\n", raw_val, weight_kg);
+    printk(">>> SUROWY: %d | WAGA: %.3f kg | TEMP: %.2f st.C <<<\n", 
+           raw_val, weight_kg, (float)current_temperature / 100.0);
+}
+
+/* ============================================================================
+ * CZUJNIK TEMPERATURY DS18B20
+ * ============================================================================ */
+static const struct device *ds18b20_dev = DEVICE_DT_GET_ANY(maxim_ds18b20);
+
+static int16_t read_real_temperature(void) {
+    if (!device_is_ready(ds18b20_dev)) {
+        printk("WARN: Czujnik DS18B20 nie jest podlaczony lub gotowy!\n");
+        return 2250; // Wartosc awaryjna (22.50 st C) jesli czujnik odpadnie
+    }
+
+    struct sensor_value temp;
+    if (sensor_sample_fetch(ds18b20_dev) == 0) {
+        sensor_channel_get(ds18b20_dev, SENSOR_CHAN_AMBIENT_TEMP, &temp);
+        double temp_c = sensor_value_to_double(&temp);
+        int16_t temp_x100 = (int16_t)(temp_c * 100);
+        // printk(">>> DS18B20: %.2f st. C (do BLE: %d) <<<\n", temp_c, temp_x100);
+        return temp_x100;
+    }
+    
+    printk("Blad odczytu DS18B20!\n");
+    return 2250;
 }
 
 
-
-
 /* ============================================================================
- * STRUKTURA DANYCH SENSORYCZNYCH
+ * BLUETOOTH - ADVERTISING (Nowy Standard)
  * ============================================================================ */
+// Company ID (0xFFFE) | DeviceType (0xA1) | Sensor ID (4 Bajty)
+static uint8_t mfg_data[7] = {0xFE, 0xFF, 0xA1, 0x00, 0x00, 0x00, 0x00};
 
-/**
- * Ramka zawierająca wszystkie dane z czujników
- * Pakowana bez paddingu dla optymalnej transmisji BLE
- */
-struct __packed sensor_frame_t {
-    uint8_t  dev_id_3[3];    // 24-bitowy ID urządzenia (z FICR)
-    uint32_t date_hour;      // Timestamp (na razie nieużywany)
-    int16_t  temp_x10;       // Temperatura * 10 (np. 235 = 23.5°C)
-    int16_t  hum_x10;        // Wilgotność * 10 (np. 650 = 65.0%)
-    uint16_t lux;            // Natężenie światła [lux]
-    uint32_t weight;         // Waga ula [gramy]
-    uint16_t in_bees;        // Liczba pszczół wlatujących
-    uint16_t out_bees;       // Liczba pszczół wylatujących
-    uint8_t  stat;           // Status (0/1)
-    char     pp[2];          // Marker "PP"
-};
-
-// Globalna instancja ramki danych
-static struct sensor_frame_t frame;
-
-/* ============================================================================
- * BLUETOOTH LOW ENERGY - ADVERTISING
- * ============================================================================ */
-
-// Manufacturer Data: Company ID (0x0059) + sensor_frame
-static uint8_t mfg_data[2 + sizeof(frame)] = {0x59, 0x00};
-
-// Advertising Data - zawiera flagi i manufacturer data
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
     BT_DATA(BT_DATA_MANUFACTURER_DATA, mfg_data, sizeof(mfg_data)),
 };
 
-// Scan Response Data - nazwa urządzenia
 static const struct bt_data sd[] = {
     BT_DATA(BT_DATA_NAME_COMPLETE, "BeeNode", 7),
 };
 
 /* ============================================================================
- * BLUETOOTH LOW ENERGY - GATT SERVICE
+ * BLUETOOTH - CALLBACKI ODCZYTU (GATT)
  * ============================================================================ */
-
-/**
- * UUID dla BeeNode Service: 12345678-1234-5678-1234-56789abcdef0
- * UUID dla Sensor Data Characteristic: 12345678-1234-5678-1234-56789abcdef1
- * 
- * RPi będzie szukać tego UUID i odczytywać dane
- */
-
-#define BT_UUID_BEENODE_SERVICE_VAL \
-    BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
-
-#define BT_UUID_BEENODE_SENSOR_DATA_VAL \
-    BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef1)
-
-static struct bt_uuid_128 beenode_service_uuid = BT_UUID_INIT_128(
-    BT_UUID_BEENODE_SERVICE_VAL
-);
-
-static struct bt_uuid_128 sensor_data_uuid = BT_UUID_INIT_128(
-    BT_UUID_BEENODE_SENSOR_DATA_VAL
-);
-
-/**
- * Callback do odczytu danych z charakterystyki
- * RPi wywoła to podczas bt_gatt_read()
- */
-static ssize_t read_sensor_data(struct bt_conn *conn,
-                                const struct bt_gatt_attr *attr,
-                                void *buf, uint16_t len, uint16_t offset)
-{
-    printk("GATT: Central czyta dane sensoryczne\n");
-    
-    // Zwróć całą strukturę sensor_frame
-    return bt_gatt_attr_read(conn, attr, buf, len, offset,
-                            &frame, sizeof(frame));
+// 1. ODCZYT WAGI (Flags 1B + Waga 2B)
+static ssize_t read_weight(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset) {
+    uint8_t payload[3];
+    payload[0] = 0x00; // Flaga: Waga w kilogramach (SI)
+    payload[1] = current_weight_ble & 0xFF;        // mlodszy bajt
+    payload[2] = (current_weight_ble >> 8) & 0xFF; // starszy bajt
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, payload, sizeof(payload));
 }
 
-// Definicja GATT Service
+// 2. ODCZYT PROCENTÓW BATERII
+static ssize_t read_bat_level(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset) {
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &current_battery_level, sizeof(current_battery_level));
+}
+
+// 3. ODCZYT NAPIĘCIA BATERII
+static ssize_t read_bat_voltage(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset) {
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &current_battery_voltage, sizeof(current_battery_voltage));
+}
+
+// 4. ODCZYT TEMPERATURY
+static ssize_t read_temperature(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset) {
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &current_temperature, sizeof(current_temperature));
+}
+
+/* ============================================================================
+ * BLUETOOTH - DEFINICJA STRUKTURY SERWISÓW (GATT TREE)
+ * ============================================================================ */
+// UUID dla Napięcia (Niestandardowe, z dokumentacji)
+static struct bt_uuid_128 bat_volt_uuid = BT_UUID_INIT_128(
+    BT_UUID_128_ENCODE(0x0000FFF2, 0x0000, 0x1000, 0x8000, 0x00805F9B34FB)
+);
+
 BT_GATT_SERVICE_DEFINE(beenode_svc,
-    BT_GATT_PRIMARY_SERVICE(&beenode_service_uuid),
-    BT_GATT_CHARACTERISTIC(&sensor_data_uuid.uuid,
-                          BT_GATT_CHRC_READ,
-                          BT_GATT_PERM_READ,
-                          read_sensor_data, NULL, NULL),
+    // --- SERWIS WAGI (Weight Scale: 0x181D) ---
+    BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_16(0x181D)),
+    BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_16(0x2A9D), BT_GATT_CHRC_READ, BT_GATT_PERM_READ, read_weight, NULL, NULL),
+
+    // --- SERWIS BATERII (Battery Service: 0x180F) ---
+    BT_GATT_PRIMARY_SERVICE(BT_UUID_BAS),
+    BT_GATT_CHARACTERISTIC(BT_UUID_BAS_BATTERY_LEVEL, BT_GATT_CHRC_READ, BT_GATT_PERM_READ, read_bat_level, NULL, NULL),
+    BT_GATT_CHARACTERISTIC(&bat_volt_uuid.uuid, BT_GATT_CHRC_READ, BT_GATT_PERM_READ, read_bat_voltage, NULL, NULL),
+
+    // --- SERWIS TEMPERATURY (Environmental Sensing: 0x181A) ---
+    BT_GATT_PRIMARY_SERVICE(BT_UUID_ESS),
+    BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_16(0x2A6E), BT_GATT_CHRC_READ, BT_GATT_PERM_READ, read_temperature, NULL, NULL)
 );
 
 /* ============================================================================
- * PRZYCISK (opcjonalny - do testowania)
+ * AKTUALIZACJA DANYCH BLUETOOTH (Zastępuje stare update_sensor_frame)
  * ============================================================================ */
-
-//static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(DT_ALIAS(sw0), gpios, {0});
-// static struct gpio_callback button_cb;
-// static volatile bool button_pressed = false;
-
-// static void button_pressed_isr(const struct device *dev, 
-//                                struct gpio_callback *cb, 
-//                                uint32_t pins)
-// {
-//     button_pressed = true;
-//     printk("Przycisk wciśnięty!\n");
-// }
-
-// static int button_setup(void)
-// {
-//     if (!device_is_ready(button.port)) {
-//         printk("WARN: Przycisk niedostępny\n");
-//         return -ENODEV;
-//     }
-
-//     gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
-//     // gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
-//     // gpio_init_callback(&button_cb, button_pressed_isr, BIT(button.pin));
-//     // gpio_add_callback(button.port, &button_cb);
-    
-//     printk("Przycisk skonfigurowany (pin %d)\n", button.pin);
-//     return 0;
-// }
-
-/* ============================================================================
- * GENERATORY FAKE DANYCH (do testów bez czujników)
- * ============================================================================ */
-
-static double fake_temp(void)   { 
-    return 20.0 + (sys_rand32_get() % 1000) / 100.0;  // 20.0 - 30.0°C
-}
-
-static double fake_hum(void)    { 
-    return 50.0 + (sys_rand32_get() % 500) / 10.0;    // 50.0 - 100.0%
-}
-
-static uint16_t fake_lux(void)  { 
-    return 100 + (sys_rand32_get() % 1000);           // 100 - 1100 lux
-}
-
-static uint32_t fake_weight(void) { 
-    return 100000 + (sys_rand32_get() % 50000);       // 100-150 kg
-}
-
-static uint16_t fake_in(void)   { 
-    return sys_rand32_get() % 300;                    // 0 - 300 pszczół
-}
-
-static uint16_t fake_out(void)  { 
-    return sys_rand32_get() % 300;                    // 0 - 300 pszczół
-}
-
-static uint8_t fake_stat(void) { 
-    return sys_rand32_get() % 2;                      // 0 lub 1
-}
-
-/* ============================================================================
- * ODCZYT DEVICE ID Z NRF FICR
- * ============================================================================ */
-
-/**
- * Odczytuje 24-bitowy Device ID z Factory Information Configuration Registers
- * Każdy chip NRF ma unikalny 64-bitowy ID, my używamy dolnych 24 bitów
- */
-static void read_dev_id_24(uint8_t out[3])
+static void update_ble_data(void)
 {
-    uint32_t d0 = NRF_FICR->DEVICEID[0];
-    uint32_t d1 = NRF_FICR->DEVICEID[1];
-
-    // Kombinujemy dolne 16 bitów z d0 i dolne 8 bitów z d1
-    uint32_t dev24 = ((d1 & 0xFF) << 16) | (d0 & 0xFFFF);
+    // 1. Wpisz unikalne ID mikrokontrolera do paczki Advertisingu
+    uint32_t dev_id = NRF_FICR->DEVICEID[0];
+    mfg_data[3] = (dev_id >> 24) & 0xFF;
+    mfg_data[4] = (dev_id >> 16) & 0xFF;
+    mfg_data[5] = (dev_id >> 8)  & 0xFF;
+    mfg_data[6] = dev_id & 0xFF;
     
-    out[0] = (dev24 >> 16) & 0xFF;
-    out[1] = (dev24 >> 8) & 0xFF;
-    out[2] = dev24 & 0xFF;
-    
-    printk("Device ID: 0x%02X%02X%02X\n", out[0], out[1], out[2]);
-}
+    // 2. Przelicz aktualna wage na standard BLE (jesli nie trwaja testy)
+    if (!start_calibration) {
+        int32_t raw_val = hx711_read();
+        int32_t weight_no_tare = tare_offset - raw_val;
+        if (weight_no_tare < 0 && weight_no_tare > -5000) weight_no_tare = 0; 
+        
+        double weight_kg = (double)weight_no_tare / calib_factor;
+        
+        // Zgodnie z wytycznymi: rozdzielczość 0.005 kg
+        // Żeby uzyskać wartość dla BLE matematycznie: waga / 0.005 (czyli waga * 200)
+        current_weight_ble = (uint16_t)(weight_kg * 200.0);
+    }
 
-/* ============================================================================
- * AKTUALIZACJA RAMKI DANYCH
- * ============================================================================ */
-
-/**
- * Odświeża wszystkie dane w strukturze sensor_frame
- * Kopiuje dane do manufacturer data dla advertising
- */
-static void update_sensor_frame(void)
-{
-    // Odczytaj Device ID (tylko raz na początku, ale dla pewności każdorazowo)
-    read_dev_id_24(frame.dev_id_3);
-    
-    // Timestamp (TODO: dodać real-time clock)
-    frame.date_hour = k_uptime_get_32() / 1000; // uptime w sekundach
-    
-    // Odczyt czujników (na razie fake data)
-    frame.temp_x10 = (int16_t)(fake_temp() * 10);
-    frame.hum_x10  = (int16_t)(fake_hum() * 10);
-    frame.lux      = fake_lux();
-    frame.weight   = fake_weight();
-    frame.in_bees  = fake_in();
-    frame.out_bees = fake_out();
-    frame.stat     = fake_stat();
-    
-    // Marker
-    frame.pp[0] = 'P';
-    frame.pp[1] = 'P';
-
-    // Skopiuj strukturę do manufacturer data (dla advertising)
-    memcpy(&mfg_data[2], &frame, sizeof(frame));
-
-    printk("Dane zaktualizowane: T=%.1f°C, H=%.1f%%, Lux=%u, Waga=%ug, In=%u, Out=%u, Stat=%u\n",
-           frame.temp_x10 / 10.0, frame.hum_x10 / 10.0, 
-           frame.lux, frame.weight, frame.in_bees, frame.out_bees, frame.stat);
+    // 3. Pobierz prawdziwa temperature z DS18B20 do GATT
+    current_temperature = read_real_temperature();
+    // -----------------
 }
 
 /* ============================================================================
@@ -536,10 +448,10 @@ static void bt_ready(int err)
 static int start_advertising(void)
 {
     // DEBUGOWANIE: Sprawdź rozmiary
-    printk("DEBUG: sizeof(sensor_frame_t) = %u\n", sizeof(struct sensor_frame_t));
-    printk("DEBUG: sizeof(mfg_data) = %u\n", sizeof(mfg_data));
-    printk("DEBUG: Total AD payload = %u bytes\n", 
-           3 + sizeof(mfg_data) + 2);  // FLAGS + MFG_DATA + overhead
+    // printk("DEBUG: sizeof(sensor_frame_t) = %u\n", sizeof(struct sensor_frame_t));
+    // printk("DEBUG: sizeof(mfg_data) = %u\n", sizeof(mfg_data));
+    // printk("DEBUG: Total AD payload = %u bytes\n", 
+    //        3 + sizeof(mfg_data) + 2);  // FLAGS + MFG_DATA + overhead
     
     // Sprawdź czy BT jest gotowy
     if (!bt_is_ready()) {
@@ -693,7 +605,7 @@ int main(void)
                ADVERTISING_DURATION_MS / 1000);
         
         // Zaktualizuj dane przed rozpoczęciem advertising
-        update_sensor_frame();
+        update_ble_data();
         
         // Rozpocznij advertising
         err = start_advertising();
@@ -729,7 +641,7 @@ int main(void)
             
             // Aktualizuj dane w advertising co jakiś czas
             if ((k_uptime_get() - adv_start_time) % ADV_UPDATE_INTERVAL_MS == 0) {
-                update_sensor_frame();
+                update_ble_data();
                 bt_le_adv_update_data(ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
             }
             
