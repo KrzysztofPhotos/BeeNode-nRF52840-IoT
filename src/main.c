@@ -112,7 +112,8 @@ static int32_t hx711_read(void) {
 int32_t tare_offset = -600000;         // Domyslna tara
 float calib_factor = 1000000.0;        // Domyslny wspolczynnik
 float known_weight_kg = 0.1835;         // WAGA REDMI NOTE 12 4g
-volatile bool start_calibration = false;
+volatile bool start_tare = false;
+volatile bool start_calib = false;
 
 // Funkcja obsługująca zapis/odczyt z pamięci flash (NVS)
 static int scale_settings_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg) {
@@ -136,7 +137,7 @@ struct settings_handler scale_conf = {
 };
 
 /* ============================================================================
- * INTERFEJS: LED 1 (Status) i PRZYCISK SW2 (Kalibracja)
+ * INTERFEJS: LED 1, PRZYCISK SW2 (Tara), PRZYCISK SW3 (Kalibracja)
  * ============================================================================ */
 // --- LED i Timer do mrugania w tle ---
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
@@ -161,12 +162,20 @@ static void set_led_mode(enum led_mode mode) {
     }
 }
 
-// --- Przycisk SW2 (Button 2) do Kalibracji ---
-static const struct gpio_dt_spec btn_calib = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+// --- Przycisk SW2 (Button 2) do Tary ---
+static const struct gpio_dt_spec btn_tare = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static struct gpio_callback btn_tare_cb;
+
+static void btn_tare_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    start_tare = true;
+}
+
+// --- Przycisk SW3 (Button 3) do Kalibracji ---
+static const struct gpio_dt_spec btn_calib = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
 static struct gpio_callback btn_calib_cb;
 
 static void btn_calib_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
-    start_calibration = true;
+    start_calib = true;
 }
 
 static int ui_setup(void) {
@@ -175,16 +184,27 @@ static int ui_setup(void) {
         gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
     }
 
-    // 2. Inicjalizacja Przycisku SW2
+    // 2. Inicjalizacja Przycisku SW2 (Tara)
+    if (device_is_ready(btn_tare.port)) {
+        gpio_pin_configure_dt(&btn_tare, GPIO_INPUT | GPIO_PULL_UP);
+        gpio_pin_interrupt_configure_dt(&btn_tare, GPIO_INT_EDGE_TO_ACTIVE);
+        gpio_init_callback(&btn_tare_cb, btn_tare_isr, BIT(btn_tare.pin));
+        gpio_add_callback(btn_tare.port, &btn_tare_cb);
+    } else {
+        printk("WARN: Przycisk SW2 niedostepny!\n");
+    }
+
+    // 3. Inicjalizacja Przycisku SW3 (Kalibracja)
     if (device_is_ready(btn_calib.port)) {
         gpio_pin_configure_dt(&btn_calib, GPIO_INPUT | GPIO_PULL_UP);
         gpio_pin_interrupt_configure_dt(&btn_calib, GPIO_INT_EDGE_TO_ACTIVE);
         gpio_init_callback(&btn_calib_cb, btn_calib_isr, BIT(btn_calib.pin));
         gpio_add_callback(btn_calib.port, &btn_calib_cb);
-        printk("Gotowe! SW2 odpala kalibracje, LED0 pokazuje status.\n");
     } else {
-        printk("WARN: Przycisk SW2 niedostepny!\n");
+        printk("WARN: Przycisk SW3 niedostepny!\n");
     }
+
+    printk("Gotowe! SW1: Test (Wybudzenie), SW2: Tara, SW3: Kalibracja, LED0: status.\n");
     return 0;
 }
 
@@ -213,47 +233,53 @@ int16_t  current_temperature = 2250;   // Temperatura (2250 = 22.50 °C)
  * ODCZYT I KALIBRACJA WAGI
  * ============================================================================ */
 static void test_read_weight(void) {
-    // 1. PROCEDURA KALIBRACJI (Zainspirowana Arduino - z opoznieniami)
-    if (start_calibration) {
-        start_calibration = false;
+    // 1. PROCEDURA TARY
+    if (start_tare) {
+        start_tare = false;
         
         printk("\n========================================\n");
-        printk("          START KALIBRACJI\n");
+        printk("          START TARY (SW2)\n");
         printk("========================================\n");
         
-        // FAZA 1: TARA (WOLNE MRUGANIE)
         set_led_mode(LED_BLINK_SLOW);
         printk("1. Zdejmij wszystko z wagi!\n");
         printk("   Masz 5 sekund...\n");
         k_sleep(K_SECONDS(5));
         
-        // Odpowiednik Arduino: scale.tare();
-        tare_offset = hx711_read_average(10); // Pobieramy srednia z 10 pomiarow
+        tare_offset = hx711_read_average(10);
         settings_save_one("scale/tare", &tare_offset, sizeof(tare_offset));
-        printk(">>> Tara zrobiona! (Wartosc: %d) <<<\n\n", tare_offset);
+        printk(">>> Tara zrobiona! (Wartosc: %d) <<<\n", tare_offset);
+        printk("========================================\n\n");
         
-        // FAZA 2: WSPÓŁCZYNNIK (SZYBKIE MRUGANIE)
+        set_led_mode(LED_OFF);
+        return; 
+    }
+
+    // 2. PROCEDURA KALIBRACJI
+    if (start_calib) {
+        start_calib = false;
+        
+        printk("\n========================================\n");
+        printk("        START KALIBRACJI (SW3)\n");
+        printk("========================================\n");
+        
         set_led_mode(LED_BLINK_FAST);
-        printk("2. Poloz swoj telefon (%.3f kg) na wadze!\n", known_weight_kg);
+        printk("1. Poloz swoj telefon (%.3f kg) na wadze!\n", known_weight_kg);
         printk("   Masz 5 sekund...\n");
         k_sleep(K_SECONDS(5));
         
-        // Odpowiednik Arduino: scale.get_units(10) i matematyka
         int32_t reading = hx711_read_average(10);
         calib_factor = (float)(tare_offset - reading) / known_weight_kg;
         settings_save_one("scale/factor", &calib_factor, sizeof(calib_factor));
         
         printk(">>> Wspolczynnik wyliczony! (Wartosc: %.1f) <<<\n", calib_factor);
-        printk("========================================\n");
-        printk("        KALIBRACJA ZAKONCZONA!\n");
         printk("========================================\n\n");
         
-        // KONIEC: WYLACZ DIODE
         set_led_mode(LED_OFF);
         return; 
     }
 
-    // 2. NORMALNY ODCZYT (odpala sie caly czas, gdy nie kalibrujemy)
+    // 3. NORMALNY ODCZYT (odpala sie caly czas, gdy nie kalibrujemy)
     int32_t raw_val = hx711_read();
     int32_t weight_no_tare = tare_offset - raw_val;
     
@@ -370,7 +396,7 @@ static void update_ble_data(void)
     mfg_data[6] = dev_id & 0xFF;
     
     // 2. Przelicz aktualna wage na standard BLE (jesli nie trwaja testy)
-    if (!start_calibration) {
+    if (!start_tare && !start_calib) {
         int32_t raw_val = hx711_read();
         int32_t weight_no_tare = tare_offset - raw_val;
         if (weight_no_tare < 0 && weight_no_tare > -5000) weight_no_tare = 0; 
