@@ -7,10 +7,9 @@
  * 
  * Tryb pracy:
  * 1. Deep Sleep (System OFF) przez 10 minut
- * 2. Wybudzenie przez RTC
- * 3. Advertising przez 30 sekund (możliwość połączenia z RPi)
- * 4. Jeśli RPi się połączy - wysyłanie danych przez GATT
- * 5. Powrót do Deep Sleep
+ * 2. Wybudzenie przez RTC lub Przyciski
+ * 3. Advertising / Obsługa akcji (Test, Tara, Kalibracja)
+ * 4. Powrót do Deep Sleep
  * 
  * Architektura BLE:
  * - NRF52840 = Peripheral (slave)
@@ -37,16 +36,30 @@
 #include <zephyr/settings/settings.h>
 
 /* ============================================================================
- * KONFIGURACJA CZASOWA
+ * KONFIGURACJA URZĄDZENIA (Łatwa edycja)
  * ============================================================================ */
-#define ADVERTISING_DURATION_MS  30000   // 30 sekund advertising (30000)
-#define DEEP_SLEEP_DURATION_S    600     // 10 minut deep sleep (600)
-#define ADV_UPDATE_INTERVAL_MS   1000    // Aktualizacja danych co 1s podczas advertising
 
+// --- CZASY OPERACJI ---
+#define SLEEP_INTERVAL_S          600    // Czas głębokiego snu między pomiarami (10 min)
+#define TEST_ADV_DURATION_MS      15000  // Jak długo waga czeka na połączenie po kliknięciu TEST (15s)
+#define TARE_LED_DURATION_MS      1500   // Jak długo świeci czerwona dioda przy Tarze (ms)
+#define CAL_PREPARATION_S         10     // Czas na położenie ciężaru (mruganie zielonej diody)
+#define CAL_MEASUREMENT_S         2      // Czas na stabilny odczyt (ciągłe światło zielone)
+#define ADV_UPDATE_INTERVAL_MS    1000   // Odświeżanie danych w paczce Bluetooth (ms)
 
-// Definicje pinow dla nRF52840-DK (DT=27, SCK=26)
-#define HX711_DT_PIN  27
-#define HX711_SCK_PIN 26
+// --- MAPOWANIE DIOD (Aliasy z DeviceTree) ---
+#define LED_GREEN_NODE            DT_ALIAS(led0) // LED1 na płytce DK
+#define LED_RED_NODE              DT_ALIAS(led1) // LED2 na płytce DK
+
+// --- MAPOWANIE PINÓW (WAKE-UP) ---
+// Uwaga: Te numery muszą zgadzać się z fizycznym podpięciem do nRF52840
+#define PIN_BTN_TEST              11  // P0.11 (SW1 na DK)
+#define PIN_BTN_TARE              12  // P0.12 (SW2 na DK)
+#define PIN_BTN_CAL               24  // P0.24 (SW3 na DK)
+
+// --- KONFIGURACJA HX711 ---
+#define HX711_DT_PIN              27  // P0.27
+#define HX711_SCK_PIN             26  // P0.26
 
 static const struct device *gpio0_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 
@@ -59,7 +72,7 @@ static void hx711_init(void) {
     // Zegar jako wyjscie (stan niski na start), Dane jako wejscie
     gpio_pin_configure(gpio0_dev, HX711_SCK_PIN, GPIO_OUTPUT_INACTIVE);
     gpio_pin_configure(gpio0_dev, HX711_DT_PIN, GPIO_INPUT);
-    printk("HX711 zainicjalizowany recznie (pin 26 i 27)\n");
+    printk("HX711 zainicjalizowany recznie (pin %d i %d)\n", HX711_SCK_PIN, HX711_DT_PIN);
 }
 
 // Funkcja bit-banging czytajaca dane z HX711
@@ -138,8 +151,8 @@ struct settings_handler scale_conf = {
  * INTERFEJS: LED 1, LED 2, PRZYCISK SW2 (Tara), PRZYCISK SW3 (Kalibracja)
  * ============================================================================ */
 // --- LED i Timer do mrugania w tle ---
-static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED_GREEN_NODE, gpios);
+static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED_RED_NODE, gpios);
 
 static void led_timer_isr(struct k_timer *timer_id) {
     gpio_pin_toggle_dt(&led0); // Zmiana stanu diody na przeciwny
@@ -161,11 +174,9 @@ static void set_led_mode(enum led_mode mode) {
     }
 }
 
-// --- Przycisk SW2 (Button 2) do Tary ---
-static const struct gpio_dt_spec btn_tare = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
-
-// --- Przycisk SW3 (Button 3) do Kalibracji ---
-static const struct gpio_dt_spec btn_calib = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+// Struktury dla przycisków (do odczytu stanu)
+static const struct gpio_dt_spec btn_tare_spec = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static const struct gpio_dt_spec btn_cal_spec = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
 
 static int ui_setup(void) {
     // 1. Inicjalizacja LED0 (Zielona)
@@ -179,15 +190,15 @@ static int ui_setup(void) {
     }
 
     // 3. Inicjalizacja Przycisku SW2 (Tara)
-    if (device_is_ready(btn_tare.port)) {
-        gpio_pin_configure_dt(&btn_tare, GPIO_INPUT | GPIO_PULL_UP);
+    if (device_is_ready(btn_tare_spec.port)) {
+        gpio_pin_configure_dt(&btn_tare_spec, GPIO_INPUT | GPIO_PULL_UP);
     } else {
         printk("WARN: Przycisk SW2 niedostepny!\n");
     }
 
     // 4. Inicjalizacja Przycisku SW3 (Kalibracja)
-    if (device_is_ready(btn_calib.port)) {
-        gpio_pin_configure_dt(&btn_calib, GPIO_INPUT | GPIO_PULL_UP);
+    if (device_is_ready(btn_cal_spec.port)) {
+        gpio_pin_configure_dt(&btn_cal_spec, GPIO_INPUT | GPIO_PULL_UP);
     } else {
         printk("WARN: Przycisk SW3 niedostepny!\n");
     }
@@ -417,15 +428,7 @@ static int start_advertising(void)
 
     int err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
     if (err) {
-        printk("ERROR: Błąd startu advertising: %d (", err);
-        switch(err) {
-            case -EINVAL: printk("EINVAL - nieprawidłowe parametry)\n"); break;
-            case -EALREADY: printk("EALREADY - advertising już aktywny)\n"); break;
-            case -ENOTSUP: printk("ENOTSUP - niewspierana operacja)\n"); break;
-            case -ENOMEM: printk("ENOMEM - brak pamięci)\n"); break;
-            case -EAGAIN: printk("EAGAIN - spróbuj ponownie)\n"); break;
-            default: printk("Nieznany błąd)\n");
-        }
+        printk("ERROR: Błąd startu advertising: %d\n", err);
         return err;
     }
 
@@ -451,19 +454,13 @@ static void stop_advertising(void)
  * ============================================================================ */
 
 /**
- * Przechodzi w tryb System OFF z wybudzeniem przez RTC
- * 
- * UWAGA: W trybie System OFF:
- * - Zatrzymane są wszystkie peryferia (BLE, UART, itp.)
- * - Pobór prądu ~0.4 µA
- * - Wybudzenie = reset systemu (program startuje od początku)
- * - Zachowana jest tylko pamięć RAM (jeśli skonfigurowana)
+ * Przechodzi w tryb System OFF z wybudzeniem przez RTC i Przyciski
  * 
  * @param seconds Czas snu w sekundach
  */
 static void enter_deep_sleep(uint32_t seconds)
 {
-    printk("System OFF na %u sekund\n", seconds);
+    printk("Zasypiam na %u sekund\n", seconds);
 
     /* 1. Start LFCLK (RTC tego wymaga) */
     NRF_CLOCK->TASKS_LFCLKSTART = 1;
@@ -486,26 +483,14 @@ static void enter_deep_sleep(uint32_t seconds)
     NRF_RTC1->TASKS_START = 1;
 
     /* 3. Wake-up z przycisków */
-    // P0.11 – BUTTON1 (TEST / SW1)
-    NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0,11)] =
-        (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos) |
-        (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
-        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
-        (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos);
-
-    // P0.12 – BUTTON2 (TARE / SW2)
-    NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0,12)] =
-        (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos) |
-        (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
-        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
-        (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos);
-
-    // P0.24 – BUTTON3 (CAL / SW3)
-    NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0,24)] =
-        (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos) |
-        (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
-        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
-        (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos);
+    uint32_t wakeup_pins[] = {PIN_BTN_TEST, PIN_BTN_TARE, PIN_BTN_CAL};
+    for (int i = 0; i < 3; i++) {
+        NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0, wakeup_pins[i])] =
+            (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos) |
+            (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
+            (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+            (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos);
+    }
 
     printk("SYSTEM OFF\n");
 
@@ -535,7 +520,7 @@ int main(void)
     // Inicjalizacja naszej wagi
     hx711_init();
 
-    // Inicjalizacja interfejsu (LED + SW2)
+    // Inicjalizacja interfejsu
     ui_setup();
 
     // --- Inicjalizacja i wczytanie pamieci ---
@@ -564,32 +549,31 @@ int main(void)
     uint32_t latch = NRF_P0->LATCH;
     NRF_P0->LATCH = 0xFFFFFFFF; // Wyczyść LATCH
 
-    // Przycisk SW2 (Tara) to P0.12, Przycisk SW3 (Kalibracja) to P0.24
     // Sprawdzamy czy wybudzenie nastapilo z konkretnego pinu, lub czy jest on wciaz wcisniety
-    bool is_tare = (latch & (1 << 12)) || (gpio_pin_get_dt(&btn_tare) == 1);
-    bool is_cal = (latch & (1 << 24)) || (gpio_pin_get_dt(&btn_calib) == 1);
+    bool is_tare = (latch & (1 << PIN_BTN_TARE)) || (gpio_pin_get_dt(&btn_tare_spec) == 1);
+    bool is_cal = (latch & (1 << PIN_BTN_CAL)) || (gpio_pin_get_dt(&btn_cal_spec) == 1);
 
     if (is_tare) {
         printk(">>> TRYB: TARE (Zapis punktu zerowego)\n");
         printk("Pusto na wadze. Zrozumiałem, zapisałem nowe zero.\n");
         
-        gpio_pin_set_dt(&led1, 1); // Zapal LED2 (Czerwona) na ~1 sekunde
+        gpio_pin_set_dt(&led1, 1); // Zapal LED2 (Czerwona)
         
-        tare_offset = hx711_read_average(10); // Odczyt i usrednienie (zajmie chwile)
+        tare_offset = hx711_read_average(10); // Odczyt i usrednienie
         settings_save_one("scale/tare", &tare_offset, sizeof(tare_offset));
         
-        k_sleep(K_MSEC(1000)); // Upewnij sie, ze minela co najmniej sekunda
+        k_sleep(K_MSEC(TARE_LED_DURATION_MS));
         gpio_pin_set_dt(&led1, 0); // Zgas LED2
         
     } else if (is_cal) {
         printk(">>> TRYB: CALIBRATION (Kalibracja odważnikiem)\n");
         
         // Faza 1: Pulsowanie (czas na reakcje)
-        printk("Masz 10 sekund, żeby spokojnie położyć ciężar na szali...\n");
+        printk("Masz %d sekund, żeby spokojnie położyć ciężar na szali...\n", CAL_PREPARATION_S);
         set_led_mode(LED_BLINK_FAST);
-        k_sleep(K_SECONDS(10));
+        k_sleep(K_SECONDS(CAL_PREPARATION_S));
         
-        // Faza 2: Zapis (Swiatlo ciagle na 2 sekundy)
+        // Faza 2: Zapis (Swiatlo ciagle)
         set_led_mode(LED_OFF);
         gpio_pin_set_dt(&led0, 1);
         printk("Czytam wage...\n");
@@ -599,7 +583,7 @@ int main(void)
         settings_save_one("scale/factor", &calib_factor, sizeof(calib_factor));
         
         printk(">>> Wspolczynnik wyliczony! (Wartosc: %.1f)\n", calib_factor);
-        k_sleep(K_SECONDS(2));
+        k_sleep(K_SECONDS(CAL_MEASUREMENT_S));
         gpio_pin_set_dt(&led0, 0);
         
     } else {
@@ -616,11 +600,12 @@ int main(void)
         
         err = start_advertising();
         if (!err) {
-            // Szybka wysylka przez 5 sekund
+            // Szybka wysylka
             uint64_t adv_start_time = k_uptime_get();
-            while (k_uptime_get() - adv_start_time < 5000) {
+            while (k_uptime_get() - adv_start_time < TEST_ADV_DURATION_MS) {
                 if (current_conn) {
-                    k_sleep(K_SECONDS(2));
+                    // Po połączeniu czekaj chwilę i rozłącz
+                    k_sleep(K_SECONDS(5));
                     bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
                     break;
                 }
@@ -635,49 +620,7 @@ int main(void)
     }
 
     // Powrot do spania
-    enter_deep_sleep(DEEP_SLEEP_DURATION_S);
+    enter_deep_sleep(SLEEP_INTERVAL_S);
 
     return 0;
 }
-
-/**
- * ============================================================================
- * NOTATKI IMPLEMENTACYJNE
- * ============================================================================
- * 
- * TODO dla pełnej funkcjonalności:
- * 
- * 1. DEEP SLEEP:
- *    - Zamień __WFE() loop na sys_poweroff() gdy SDK to wspiera
- *    - Skonfiguruj retention RAM jeśli potrzebne
- *    - Dodaj GPIO wake-up jako backup (np. przycisk)
- * 
- * 2. POWER MANAGEMENT:
- *    - Włącz CONFIG_PM=y w prj.conf
- *    - Optymalizuj power consumption w stanie advertising
- *    - Zmierz rzeczywisty pobór prądu
- * 
- * 3. REAL-TIME CLOCK:
- *    - Dodaj obsługę RTC dla timestamp w date_hour
- *    - Synchronizacja czasu z RPi przy pierwszym połączeniu
- * 
- * 4. CZUJNIKI:
- *    - Zamień fake_*() na prawdziwe odczyty I2C/SPI
- *    - Dodaj error handling dla czujników
- *    - Kalibracja czujników
- * 
- * 5. GATT:
- *    - Dodaj więcej charakterystyk (konfiguracja, status, itp.)
- *    - Notifications dla real-time data streaming
- *    - Write characteristic dla konfiguracji zdalnej
- * 
- * 6. TESTOWANIE:
- *    - Test z nRF Connect (advertising + GATT)
- *    - Test z RPi Central (automatyczne połączenie)
- *    - Test power consumption
- *    - Test długoterminowy (stabilność)
- * 
- * ============================================================================
- */
-
- 
