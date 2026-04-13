@@ -112,8 +112,6 @@ static int32_t hx711_read(void) {
 int32_t tare_offset = -600000;         // Domyslna tara
 float calib_factor = 1000000.0;        // Domyslny wspolczynnik
 float known_weight_kg = 0.1835;         // WAGA REDMI NOTE 12 4g
-volatile bool start_tare = false;
-volatile bool start_calib = false;
 
 // Funkcja obsługująca zapis/odczyt z pamięci flash (NVS)
 static int scale_settings_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg) {
@@ -137,10 +135,11 @@ struct settings_handler scale_conf = {
 };
 
 /* ============================================================================
- * INTERFEJS: LED 1, PRZYCISK SW2 (Tara), PRZYCISK SW3 (Kalibracja)
+ * INTERFEJS: LED 1, LED 2, PRZYCISK SW2 (Tara), PRZYCISK SW3 (Kalibracja)
  * ============================================================================ */
 // --- LED i Timer do mrugania w tle ---
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 
 static void led_timer_isr(struct k_timer *timer_id) {
     gpio_pin_toggle_dt(&led0); // Zmiana stanu diody na przeciwny
@@ -164,47 +163,36 @@ static void set_led_mode(enum led_mode mode) {
 
 // --- Przycisk SW2 (Button 2) do Tary ---
 static const struct gpio_dt_spec btn_tare = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
-static struct gpio_callback btn_tare_cb;
-
-static void btn_tare_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
-    start_tare = true;
-}
 
 // --- Przycisk SW3 (Button 3) do Kalibracji ---
 static const struct gpio_dt_spec btn_calib = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
-static struct gpio_callback btn_calib_cb;
-
-static void btn_calib_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
-    start_calib = true;
-}
 
 static int ui_setup(void) {
-    // 1. Inicjalizacja LED
+    // 1. Inicjalizacja LED0 (Zielona)
     if (device_is_ready(led0.port)) {
         gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
     }
 
-    // 2. Inicjalizacja Przycisku SW2 (Tara)
+    // 2. Inicjalizacja LED1 (Czerwona)
+    if (device_is_ready(led1.port)) {
+        gpio_pin_configure_dt(&led1, GPIO_OUTPUT_INACTIVE);
+    }
+
+    // 3. Inicjalizacja Przycisku SW2 (Tara)
     if (device_is_ready(btn_tare.port)) {
         gpio_pin_configure_dt(&btn_tare, GPIO_INPUT | GPIO_PULL_UP);
-        gpio_pin_interrupt_configure_dt(&btn_tare, GPIO_INT_EDGE_TO_ACTIVE);
-        gpio_init_callback(&btn_tare_cb, btn_tare_isr, BIT(btn_tare.pin));
-        gpio_add_callback(btn_tare.port, &btn_tare_cb);
     } else {
         printk("WARN: Przycisk SW2 niedostepny!\n");
     }
 
-    // 3. Inicjalizacja Przycisku SW3 (Kalibracja)
+    // 4. Inicjalizacja Przycisku SW3 (Kalibracja)
     if (device_is_ready(btn_calib.port)) {
         gpio_pin_configure_dt(&btn_calib, GPIO_INPUT | GPIO_PULL_UP);
-        gpio_pin_interrupt_configure_dt(&btn_calib, GPIO_INT_EDGE_TO_ACTIVE);
-        gpio_init_callback(&btn_calib_cb, btn_calib_isr, BIT(btn_calib.pin));
-        gpio_add_callback(btn_calib.port, &btn_calib_cb);
     } else {
         printk("WARN: Przycisk SW3 niedostepny!\n");
     }
 
-    printk("Gotowe! SW1: Test (Wybudzenie), SW2: Tara, SW3: Kalibracja, LED0: status.\n");
+    printk("Gotowe! SW1: Test (Wybudzenie), SW2: Tara, SW3: Kalibracja, LED0/LED1: status.\n");
     return 0;
 }
 
@@ -228,70 +216,6 @@ uint8_t  current_battery_level = 88;   // Procent baterii (0-100%)
 uint16_t current_battery_voltage = 395;// Napiecie baterii (395 = 3.95V)
 int16_t  current_temperature = 2250;   // Temperatura (2250 = 22.50 °C)
 
-
-/* ============================================================================
- * ODCZYT I KALIBRACJA WAGI
- * ============================================================================ */
-static void test_read_weight(void) {
-    // 1. PROCEDURA TARY
-    if (start_tare) {
-        start_tare = false;
-        
-        printk("\n========================================\n");
-        printk("          START TARY (SW2)\n");
-        printk("========================================\n");
-        
-        set_led_mode(LED_BLINK_SLOW);
-        printk("1. Zdejmij wszystko z wagi!\n");
-        printk("   Masz 5 sekund...\n");
-        k_sleep(K_SECONDS(5));
-        
-        tare_offset = hx711_read_average(10);
-        settings_save_one("scale/tare", &tare_offset, sizeof(tare_offset));
-        printk(">>> Tara zrobiona! (Wartosc: %d) <<<\n", tare_offset);
-        printk("========================================\n\n");
-        
-        set_led_mode(LED_OFF);
-        return; 
-    }
-
-    // 2. PROCEDURA KALIBRACJI
-    if (start_calib) {
-        start_calib = false;
-        
-        printk("\n========================================\n");
-        printk("        START KALIBRACJI (SW3)\n");
-        printk("========================================\n");
-        
-        set_led_mode(LED_BLINK_FAST);
-        printk("1. Poloz swoj telefon (%.3f kg) na wadze!\n", known_weight_kg);
-        printk("   Masz 5 sekund...\n");
-        k_sleep(K_SECONDS(5));
-        
-        int32_t reading = hx711_read_average(10);
-        calib_factor = (float)(tare_offset - reading) / known_weight_kg;
-        settings_save_one("scale/factor", &calib_factor, sizeof(calib_factor));
-        
-        printk(">>> Wspolczynnik wyliczony! (Wartosc: %.1f) <<<\n", calib_factor);
-        printk("========================================\n\n");
-        
-        set_led_mode(LED_OFF);
-        return; 
-    }
-
-    // 3. NORMALNY ODCZYT (odpala sie caly czas, gdy nie kalibrujemy)
-    int32_t raw_val = hx711_read();
-    int32_t weight_no_tare = tare_offset - raw_val;
-    
-    // Delikatne zerowanie szumow w okolicach zera (do 5 gramow)
-    if (weight_no_tare < 0 && weight_no_tare > -5000) {
-        weight_no_tare = 0; 
-    }
-    
-    double weight_kg = (double)weight_no_tare / calib_factor;
-    printk(">>> SUROWY: %d | WAGA: %.3f kg | TEMP: %.2f st.C <<<\n", 
-           raw_val, weight_kg, (float)current_temperature / 100.0);
-}
 
 /* ============================================================================
  * CZUJNIK TEMPERATURY DS18B20
@@ -395,18 +319,16 @@ static void update_ble_data(void)
     mfg_data[5] = (dev_id >> 8)  & 0xFF;
     mfg_data[6] = dev_id & 0xFF;
     
-    // 2. Przelicz aktualna wage na standard BLE (jesli nie trwaja testy)
-    if (!start_tare && !start_calib) {
-        int32_t raw_val = hx711_read();
-        int32_t weight_no_tare = tare_offset - raw_val;
-        if (weight_no_tare < 0 && weight_no_tare > -5000) weight_no_tare = 0; 
-        
-        double weight_kg = (double)weight_no_tare / calib_factor;
-        
-        // Zgodnie z wytycznymi: rozdzielczość 0.005 kg
-        // Żeby uzyskać wartość dla BLE matematycznie: waga / 0.005 (czyli waga * 200)
-        current_weight_ble = (uint16_t)(weight_kg * 200.0);
-    }
+    // 2. Przelicz aktualna wage na standard BLE
+    int32_t raw_val = hx711_read();
+    int32_t weight_no_tare = tare_offset - raw_val;
+    if (weight_no_tare < 0 && weight_no_tare > -5000) weight_no_tare = 0; 
+    
+    double weight_kg = (double)weight_no_tare / calib_factor;
+    
+    // Zgodnie z wytycznymi: rozdzielczość 0.005 kg
+    // Żeby uzyskać wartość dla BLE matematycznie: waga / 0.005 (czyli waga * 200)
+    current_weight_ble = (uint16_t)(weight_kg * 200.0);
 
     // 3. Pobierz prawdziwa temperature z DS18B20 do GATT
     current_temperature = read_real_temperature();
@@ -563,8 +485,23 @@ static void enter_deep_sleep(uint32_t seconds)
     NRF_RTC1->EVTENSET = RTC_EVTENSET_COMPARE0_Msk;
     NRF_RTC1->TASKS_START = 1;
 
-    /* 3. Wake-up z przycisku (P0.11 – BUTTON1) */
+    /* 3. Wake-up z przycisków */
+    // P0.11 – BUTTON1 (TEST / SW1)
     NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0,11)] =
+        (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos) |
+        (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
+        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+        (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos);
+
+    // P0.12 – BUTTON2 (TARE / SW2)
+    NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0,12)] =
+        (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos) |
+        (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
+        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+        (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos);
+
+    // P0.24 – BUTTON3 (CAL / SW3)
+    NRF_GPIO->PIN_CNF[NRF_GPIO_PIN_MAP(0,24)] =
         (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos) |
         (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
         (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
@@ -623,80 +560,82 @@ int main(void)
 
     printk("\n=== GŁÓWNA PĘTLA PROGRAMU ===\n\n");
 
-    while (1) {
-        // ---------------------------------------------------------------
-        // FAZA 1: ADVERTISING (30 sekund)
-        // ---------------------------------------------------------------
-        printk(">>> FAZA 1: Advertising przez %d sekund\n", 
-               ADVERTISING_DURATION_MS / 1000);
+    // Odczytaj rejestr LATCH (zapisuje piny, ktore wybudzily z System OFF)
+    uint32_t latch = NRF_P0->LATCH;
+    NRF_P0->LATCH = 0xFFFFFFFF; // Wyczyść LATCH
+
+    // Przycisk SW2 (Tara) to P0.12, Przycisk SW3 (Kalibracja) to P0.24
+    // Sprawdzamy czy wybudzenie nastapilo z konkretnego pinu, lub czy jest on wciaz wcisniety
+    bool is_tare = (latch & (1 << 12)) || (gpio_pin_get_dt(&btn_tare) == 1);
+    bool is_cal = (latch & (1 << 24)) || (gpio_pin_get_dt(&btn_calib) == 1);
+
+    if (is_tare) {
+        printk(">>> TRYB: TARE (Zapis punktu zerowego)\n");
+        printk("Pusto na wadze. Zrozumiałem, zapisałem nowe zero.\n");
         
-        // Zaktualizuj dane przed rozpoczęciem advertising
+        gpio_pin_set_dt(&led1, 1); // Zapal LED2 (Czerwona) na ~1 sekunde
+        
+        tare_offset = hx711_read_average(10); // Odczyt i usrednienie (zajmie chwile)
+        settings_save_one("scale/tare", &tare_offset, sizeof(tare_offset));
+        
+        k_sleep(K_MSEC(1000)); // Upewnij sie, ze minela co najmniej sekunda
+        gpio_pin_set_dt(&led1, 0); // Zgas LED2
+        
+    } else if (is_cal) {
+        printk(">>> TRYB: CALIBRATION (Kalibracja odważnikiem)\n");
+        
+        // Faza 1: Pulsowanie (czas na reakcje)
+        printk("Masz 10 sekund, żeby spokojnie położyć ciężar na szali...\n");
+        set_led_mode(LED_BLINK_FAST);
+        k_sleep(K_SECONDS(10));
+        
+        // Faza 2: Zapis (Swiatlo ciagle na 2 sekundy)
+        set_led_mode(LED_OFF);
+        gpio_pin_set_dt(&led0, 1);
+        printk("Czytam wage...\n");
+        
+        int32_t reading = hx711_read_average(10);
+        calib_factor = (float)(tare_offset - reading) / known_weight_kg;
+        settings_save_one("scale/factor", &calib_factor, sizeof(calib_factor));
+        
+        printk(">>> Wspolczynnik wyliczony! (Wartosc: %.1f)\n", calib_factor);
+        k_sleep(K_SECONDS(2));
+        gpio_pin_set_dt(&led0, 0);
+        
+    } else {
+        printk(">>> TRYB: TEST (Szybki pomiar)\n");
+        printk("Obudziłem się, robię szybki pomiar i wracam do spania.\n");
+        
+        // Zapal zielona diode na 1 sekunde
+        gpio_pin_set_dt(&led0, 1);
+        k_sleep(K_SECONDS(1));
+        gpio_pin_set_dt(&led0, 0);
+        
+        // Odczyt, puszcza sygnal BLE i spi
         update_ble_data();
         
-        // Rozpocznij advertising
         err = start_advertising();
-        if (err) {
-            printk("ERROR: Nie można rozpocząć advertising, restart...\n");
-            k_sleep(K_SECONDS(5));
-            continue;
-        }
-
-        // Główna pętla advertising
-        uint64_t adv_start_time = k_uptime_get();
-        bool connection_handled = false;
-        
-        while (k_uptime_get() - adv_start_time < ADVERTISING_DURATION_MS) {
-            
-            // Sprawdź czy RPi się połączył
-            if (current_conn) {
-                printk("\n!!! RPi połączony - czekam na odczyt GATT !!!\n");
-                
-                // Daj czas RPi na odczyt danych przez GATT
-                // W prawdziwej aplikacji możesz dodać notification callback
-                k_sleep(K_SECONDS(5));
-                
-                // Rozłącz się
-                printk("Rozłączam połączenie...\n");
-                bt_conn_disconnect(current_conn, 
-                                  BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-                k_sleep(K_MSEC(500));
-                
-                connection_handled = true;
-                break;  // Wyjdź z pętli advertising
+        if (!err) {
+            // Szybka wysylka przez 5 sekund
+            uint64_t adv_start_time = k_uptime_get();
+            while (k_uptime_get() - adv_start_time < 5000) {
+                if (current_conn) {
+                    k_sleep(K_SECONDS(2));
+                    bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+                    break;
+                }
+                if ((k_uptime_get() - adv_start_time) % ADV_UPDATE_INTERVAL_MS == 0) {
+                    update_ble_data();
+                    bt_le_adv_update_data(ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+                }
+                k_sleep(K_MSEC(100));
             }
-            
-            // Aktualizuj dane w advertising co jakiś czas
-            if ((k_uptime_get() - adv_start_time) % ADV_UPDATE_INTERVAL_MS == 0) {
-                update_ble_data();
-                bt_le_adv_update_data(ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-            }
-            
-            k_sleep(K_MSEC(100));
-            
-            test_read_weight(); // <--- NASZA WAGA JEST TUTAJ
+            stop_advertising();
         }
-
-        // Zatrzymaj advertising po upływie czasu
-        stop_advertising();
-
-        if (connection_handled) {
-            printk(">>> Połączenie obsłużone, przechodzę do deep sleep\n");
-        } else {
-            printk(">>> Brak połączenia, przechodzę do deep sleep\n");
-        }
-
-        // ---------------------------------------------------------------
-        // FAZA 2: DEEP SLEEP (10 minut)
-        // ---------------------------------------------------------------
-        // UWAGA: Po wybudzeniu z System OFF program restartuje od main()
-        
-        enter_deep_sleep(DEEP_SLEEP_DURATION_S);
-        
-        // Ten kod nigdy się nie wykona w prawdziwym System OFF
-        // (system się zrestartuje)
-        printk(">>> Wybudzenie z deep sleep (symulacja)\n");
-        k_sleep(K_SECONDS(2));
     }
+
+    // Powrot do spania
+    enter_deep_sleep(DEEP_SLEEP_DURATION_S);
 
     return 0;
 }
