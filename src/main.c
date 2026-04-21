@@ -604,8 +604,17 @@ int main(void)
             uint64_t adv_start_time = k_uptime_get();
             while (k_uptime_get() - adv_start_time < TEST_ADV_DURATION_MS) {
                 if (current_conn) {
-                    // Po połączeniu czekaj chwilę i rozłącz
-                    k_sleep(K_SECONDS(5));
+                    printk("BLE: Połączono - trzymam połączenie 30 sekund...\n");
+
+                    uint64_t conn_start = k_uptime_get();
+
+                    while (k_uptime_get() - conn_start < 30000) {
+                        // Możesz aktualizować dane co sekundę
+                        update_ble_data();
+                        k_sleep(K_MSEC(1000));
+                    }
+
+                    printk("BLE: Rozłączam po 30 sekundach\n");
                     bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
                     break;
                 }
