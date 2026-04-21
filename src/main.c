@@ -48,8 +48,8 @@
 #define ADV_UPDATE_INTERVAL_MS    1000   // Odświeżanie danych w paczce Bluetooth (ms)
 
 // --- MAPOWANIE DIOD (Aliasy z DeviceTree) ---
-#define LED_GREEN_NODE            DT_ALIAS(led0) // LED1 na płytce DK
-#define LED_RED_NODE              DT_ALIAS(led1) // LED2 na płytce DK
+#define LED_GREEN_NODE            DT_ALIAS(extledgreen) // Zewnętrzna dioda na P1.15
+#define LED_RED_NODE              DT_ALIAS(extledred)   // Zewnętrzna dioda na P1.14
 
 // --- MAPOWANIE PINÓW (WAKE-UP) ---
 // Uwaga: Te numery muszą zgadzać się z fizycznym podpięciem do nRF52840
